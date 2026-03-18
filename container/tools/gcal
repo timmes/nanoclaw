@@ -1,0 +1,242 @@
+#!/usr/bin/env node
+/**
+ * gcal — Google Calendar CLI for NanoClaw agents.
+ *
+ * Usage:
+ *   gcal list [--days N] [--calendar ID]      List events (default: next 7 days)
+ *   gcal today [--calendar ID]                List today's events
+ *   gcal tomorrow [--calendar ID]             List tomorrow's events
+ *   gcal week [--calendar ID]                 List this week's events
+ *   gcal add --title "..." --start "ISO" --end "ISO" [--calendar ID] [--description "..."]
+ *   gcal delete --event-id "..." [--calendar ID]
+ *
+ * Environment:
+ *   GCAL_SERVICE_ACCOUNT_KEY  Path to service account JSON key
+ *   GCAL_CALENDAR_ID          Default calendar ID (default: primary)
+ */
+
+import https from 'https';
+import fs from 'fs';
+import crypto from 'crypto';
+
+const KEY_PATH = process.env.GCAL_SERVICE_ACCOUNT_KEY || '/workspace/secrets/gcal-key.json';
+const DEFAULT_CALENDAR = process.env.GCAL_CALENDAR_ID || 'nova.hue.agent@gmail.com';
+
+// --- JWT / OAuth ---
+
+function base64url(buf) {
+  return buf.toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+function createJWT(serviceAccount) {
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const payload = {
+    iss: serviceAccount.client_email,
+    scope: 'https://www.googleapis.com/auth/calendar',
+    aud: 'https://oauth2.googleapis.com/token',
+    iat: now,
+    exp: now + 3600,
+  };
+  const segments = [
+    base64url(Buffer.from(JSON.stringify(header))),
+    base64url(Buffer.from(JSON.stringify(payload))),
+  ];
+  const sign = crypto.createSign('RSA-SHA256');
+  sign.update(segments.join('.'));
+  const signature = sign.sign(serviceAccount.private_key);
+  segments.push(base64url(signature));
+  return segments.join('.');
+}
+
+async function getAccessToken(serviceAccount) {
+  const jwt = createJWT(serviceAccount);
+  const body = `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`;
+  return new Promise((resolve, reject) => {
+    const req = https.request('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': body.length },
+    }, (res) => {
+      let data = '';
+      res.on('data', (d) => data += d);
+      res.on('end', () => {
+        if (res.statusCode !== 200) return reject(new Error(`Auth failed (${res.statusCode}): ${data}`));
+        resolve(JSON.parse(data).access_token);
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// --- Calendar API ---
+
+async function apiRequest(method, path, token, body) {
+  return new Promise((resolve, reject) => {
+    const opts = {
+      hostname: 'www.googleapis.com',
+      path,
+      method,
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    };
+    const req = https.request(opts, (res) => {
+      let data = '';
+      res.on('data', (d) => data += d);
+      res.on('end', () => {
+        if (res.statusCode >= 400) return reject(new Error(`API error (${res.statusCode}): ${data}`));
+        resolve(data ? JSON.parse(data) : {});
+      });
+    });
+    req.on('error', reject);
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
+}
+
+async function listEvents(token, calendarId, timeMin, timeMax) {
+  const params = new URLSearchParams({
+    timeMin: timeMin.toISOString(),
+    timeMax: timeMax.toISOString(),
+    singleEvents: 'true',
+    orderBy: 'startTime',
+    maxResults: '50',
+  });
+  const data = await apiRequest('GET', `/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?${params}`, token);
+  return data.items || [];
+}
+
+async function addEvent(token, calendarId, event) {
+  return apiRequest('POST', `/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`, token, event);
+}
+
+async function deleteEvent(token, calendarId, eventId) {
+  return apiRequest('DELETE', `/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`, token);
+}
+
+// --- Formatting ---
+
+function formatEvent(event) {
+  const start = event.start?.dateTime || event.start?.date || '?';
+  const end = event.end?.dateTime || event.end?.date || '';
+  const startDate = new Date(start);
+  const endDate = end ? new Date(end) : null;
+
+  let time;
+  if (event.start?.date) {
+    time = 'All day';
+  } else {
+    const fmt = (d) => d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: process.env.TZ || 'UTC' });
+    time = `${fmt(startDate)}–${endDate ? fmt(endDate) : '?'}`;
+  }
+
+  const title = event.summary || '(no title)';
+  const location = event.location ? ` | ${event.location}` : '';
+  const desc = event.description ? `\n    ${event.description.slice(0, 120)}` : '';
+  return `  ${time}  ${title}${location}${desc}`;
+}
+
+function formatDay(date, events) {
+  const dayStr = date.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'short', timeZone: process.env.TZ || 'UTC' });
+  if (events.length === 0) return `${dayStr}: no events`;
+  return `${dayStr}:\n${events.map(formatEvent).join('\n')}`;
+}
+
+// --- CLI ---
+
+function parseArgs(args) {
+  const result = { command: args[0], flags: {} };
+  for (let i = 1; i < args.length; i++) {
+    if (args[i].startsWith('--') && i + 1 < args.length) {
+      result.flags[args[i].slice(2)] = args[i + 1];
+      i++;
+    }
+  }
+  return result;
+}
+
+function startOfDay(offset = 0) {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() + offset);
+  return d;
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (args.length === 0 || args[0] === '--help') {
+    console.log(`Usage:
+  gcal list [--days N] [--calendar ID]      List events (default: next 7 days)
+  gcal today [--calendar ID]                List today's events
+  gcal tomorrow [--calendar ID]             List tomorrow's events
+  gcal week [--calendar ID]                 List this week's events
+  gcal add --title "..." --start "ISO" --end "ISO" [--calendar ID] [--description "..."] [--location "..."]
+  gcal delete --event-id "..." [--calendar ID]`);
+    process.exit(0);
+  }
+
+  if (!fs.existsSync(KEY_PATH)) {
+    console.error(`Service account key not found at: ${KEY_PATH}`);
+    console.error('Set GCAL_SERVICE_ACCOUNT_KEY to the correct path.');
+    process.exit(1);
+  }
+
+  const serviceAccount = JSON.parse(fs.readFileSync(KEY_PATH, 'utf-8'));
+  const token = await getAccessToken(serviceAccount);
+  const { command, flags } = parseArgs(args);
+  const calendarId = flags.calendar || DEFAULT_CALENDAR;
+
+  switch (command) {
+    case 'today': {
+      const events = await listEvents(token, calendarId, startOfDay(), startOfDay(1));
+      console.log(formatDay(startOfDay(), events));
+      break;
+    }
+    case 'tomorrow': {
+      const events = await listEvents(token, calendarId, startOfDay(1), startOfDay(2));
+      console.log(formatDay(startOfDay(1), events));
+      break;
+    }
+    case 'week':
+    case 'list': {
+      const days = parseInt(flags.days || '7', 10);
+      for (let i = 0; i < days; i++) {
+        const from = startOfDay(i);
+        const to = startOfDay(i + 1);
+        const events = await listEvents(token, calendarId, from, to);
+        console.log(formatDay(from, events));
+      }
+      break;
+    }
+    case 'add': {
+      if (!flags.title || !flags.start || !flags.end) {
+        console.error('Required: --title, --start (ISO datetime), --end (ISO datetime)');
+        process.exit(1);
+      }
+      const event = {
+        summary: flags.title,
+        start: { dateTime: flags.start },
+        end: { dateTime: flags.end },
+      };
+      if (flags.description) event.description = flags.description;
+      if (flags.location) event.location = flags.location;
+      const created = await addEvent(token, calendarId, event);
+      console.log(`Created: ${created.summary} (${created.htmlLink})`);
+      break;
+    }
+    case 'delete': {
+      if (!flags['event-id']) {
+        console.error('Required: --event-id');
+        process.exit(1);
+      }
+      await deleteEvent(token, calendarId, flags['event-id']);
+      console.log('Event deleted.');
+      break;
+    }
+    default:
+      console.error(`Unknown command: ${command}. Run gcal --help for usage.`);
+      process.exit(1);
+  }
+}
+
+main().catch((err) => { console.error(err.message); process.exit(1); });
