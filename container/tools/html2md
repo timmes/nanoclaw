@@ -1,0 +1,437 @@
+#!/usr/bin/env node
+/**
+ * html2md — Convert HTML to clean Markdown.
+ *
+ * Reads HTML from stdin, writes Markdown to stdout.
+ * Self-contained: no npm dependencies, uses only built-in Node.js modules.
+ *
+ * Usage:
+ *   echo "<h1>Hello</h1><p>World</p>" | html2md
+ *   curl -s https://example.com | html2md
+ */
+
+'use strict';
+
+// HTML entity map
+const ENTITIES = {
+  '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'",
+  '&nbsp;': ' ', '&ndash;': '\u2013', '&mdash;': '\u2014', '&lsquo;': '\u2018',
+  '&rsquo;': '\u2019', '&ldquo;': '\u201C', '&rdquo;': '\u201D', '&bull;': '\u2022',
+  '&hellip;': '\u2026', '&copy;': '\u00A9', '&reg;': '\u00AE', '&trade;': '\u2122',
+  '&laquo;': '\u00AB', '&raquo;': '\u00BB', '&cent;': '\u00A2', '&pound;': '\u00A3',
+  '&euro;': '\u20AC', '&deg;': '\u00B0', '&plusmn;': '\u00B1', '&times;': '\u00D7',
+  '&divide;': '\u00F7', '&frac12;': '\u00BD', '&frac14;': '\u00BC', '&frac34;': '\u00BE',
+  '&rarr;': '\u2192', '&larr;': '\u2190', '&uarr;': '\u2191', '&darr;': '\u2193',
+};
+
+function decodeEntities(text) {
+  // Named entities
+  let result = text.replace(/&[a-zA-Z]+;/g, (match) => ENTITIES[match] || match);
+  // Numeric entities (decimal)
+  result = result.replace(/&#(\d+);/g, (_, code) => {
+    const n = parseInt(code, 10);
+    return n > 0 && n < 0x110000 ? String.fromCodePoint(n) : '';
+  });
+  // Numeric entities (hex)
+  result = result.replace(/&#x([0-9a-fA-F]+);/g, (_, code) => {
+    const n = parseInt(code, 16);
+    return n > 0 && n < 0x110000 ? String.fromCodePoint(n) : '';
+  });
+  return result;
+}
+
+// Simple DOM-like parser
+class Node {
+  constructor(tag, attrs = {}) {
+    this.tag = tag;         // lowercase tag name, or '#text' for text nodes
+    this.attrs = attrs;
+    this.children = [];
+    this.text = '';         // for text nodes
+  }
+}
+
+function parseAttrs(attrString) {
+  const attrs = {};
+  const re = /([a-zA-Z_][\w-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+))/g;
+  let m;
+  while ((m = re.exec(attrString)) !== null) {
+    attrs[m[1].toLowerCase()] = decodeEntities(m[2] ?? m[3] ?? m[4]);
+  }
+  return attrs;
+}
+
+const VOID_ELEMENTS = new Set([
+  'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+  'link', 'meta', 'param', 'source', 'track', 'wbr',
+]);
+
+const STRIP_TAGS = new Set(['script', 'style', 'svg', 'noscript', 'head']);
+
+function parseHTML(html) {
+  // Remove comments
+  html = html.replace(/<!--[\s\S]*?-->/g, '');
+
+  const root = new Node('#root');
+  const stack = [root];
+
+  const tagRe = /<\/?([a-zA-Z][a-zA-Z0-9]*)((?:\s+[^>]*?)?)\s*\/?>/g;
+  let lastIndex = 0;
+  let match;
+
+  while ((match = tagRe.exec(html)) !== null) {
+    const [fullMatch, tagName, attrStr] = match;
+    const tag = tagName.toLowerCase();
+
+    // Text before this tag
+    if (match.index > lastIndex) {
+      const textContent = html.slice(lastIndex, match.index);
+      if (textContent.trim() || textContent.includes(' ')) {
+        const textNode = new Node('#text');
+        textNode.text = textContent;
+        stack[stack.length - 1].children.push(textNode);
+      }
+    }
+    lastIndex = match.index + fullMatch.length;
+
+    const isClosing = fullMatch[1] === '/';
+    const isSelfClosing = fullMatch.endsWith('/>') || VOID_ELEMENTS.has(tag);
+
+    if (isClosing) {
+      // Find matching open tag and pop
+      for (let i = stack.length - 1; i > 0; i--) {
+        if (stack[i].tag === tag) {
+          stack.length = i;
+          break;
+        }
+      }
+    } else if (STRIP_TAGS.has(tag)) {
+      // Skip content of stripped tags entirely
+      const closeRe = new RegExp(`</${tag}\\s*>`, 'i');
+      const closeMatch = closeRe.exec(html.slice(lastIndex));
+      if (closeMatch) {
+        lastIndex += closeMatch.index + closeMatch[0].length;
+        tagRe.lastIndex = lastIndex;
+      }
+    } else {
+      const attrs = parseAttrs(attrStr);
+      const node = new Node(tag, attrs);
+      stack[stack.length - 1].children.push(node);
+      if (!isSelfClosing) {
+        stack.push(node);
+      }
+    }
+  }
+
+  // Remaining text
+  if (lastIndex < html.length) {
+    const remaining = html.slice(lastIndex);
+    if (remaining.trim()) {
+      const textNode = new Node('#text');
+      textNode.text = remaining;
+      stack[stack.length - 1].children.push(textNode);
+    }
+  }
+
+  return root;
+}
+
+// --- Conversion to Markdown ---
+
+const BLOCK_TAGS = new Set([
+  'p', 'div', 'section', 'article', 'main', 'header', 'footer', 'nav',
+  'aside', 'figure', 'figcaption', 'details', 'summary',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  'ul', 'ol', 'li', 'dl', 'dt', 'dd',
+  'blockquote', 'pre', 'table', 'thead', 'tbody', 'tfoot', 'tr',
+  'hr', 'br', 'address', 'center',
+]);
+
+function isTrackingPixel(node) {
+  if (node.tag !== 'img') return false;
+  const w = node.attrs.width;
+  const h = node.attrs.height;
+  if ((w === '1' || w === '0') && (h === '1' || h === '0')) return true;
+  const src = node.attrs.src || '';
+  if (src.includes('track') || src.includes('pixel') || src.includes('beacon') ||
+      src.includes('open.') || src.includes('/o/') || src.includes('mail.')) return true;
+  return false;
+}
+
+function getTextContent(node) {
+  if (node.tag === '#text') return decodeEntities(node.text);
+  return node.children.map(getTextContent).join('');
+}
+
+function convertNode(node, ctx = {}) {
+  if (node.tag === '#text') {
+    let text = decodeEntities(node.text);
+    if (!ctx.preformatted) {
+      text = text.replace(/\r\n/g, '\n').replace(/\n/g, ' ').replace(/\t/g, ' ');
+    }
+    return text;
+  }
+
+  if (node.tag === '#root') {
+    return convertChildren(node, ctx);
+  }
+
+  // Skip tracking pixels
+  if (isTrackingPixel(node)) return '';
+
+  // Skip hidden elements
+  const style = node.attrs.style || '';
+  if (style.includes('display:none') || style.includes('display: none') ||
+      style.includes('visibility:hidden') || style.includes('visibility: hidden')) {
+    return '';
+  }
+
+  const tag = node.tag;
+
+  switch (tag) {
+    case 'br':
+      return '\n';
+
+    case 'hr':
+      return '\n\n---\n\n';
+
+    case 'h1': case 'h2': case 'h3': case 'h4': case 'h5': case 'h6': {
+      const level = parseInt(tag[1]);
+      const prefix = '#'.repeat(level);
+      const text = convertChildren(node, ctx).trim();
+      if (!text) return '';
+      return `\n\n${prefix} ${text}\n\n`;
+    }
+
+    case 'p': case 'div': case 'section': case 'article': case 'main':
+    case 'header': case 'footer': case 'nav': case 'aside':
+    case 'figure': case 'figcaption': case 'address': case 'center': {
+      const text = convertChildren(node, ctx).trim();
+      if (!text) return '';
+      return `\n\n${text}\n\n`;
+    }
+
+    case 'blockquote': {
+      const text = convertChildren(node, ctx).trim();
+      if (!text) return '';
+      const lines = text.split('\n').map((l) => `> ${l}`).join('\n');
+      return `\n\n${lines}\n\n`;
+    }
+
+    case 'pre': {
+      const text = convertChildren(node, { ...ctx, preformatted: true }).trim();
+      if (!text) return '';
+      return `\n\n\`\`\`\n${text}\n\`\`\`\n\n`;
+    }
+
+    case 'code': {
+      const text = convertChildren(node, ctx);
+      if (ctx.preformatted) return text;
+      return `\`${text}\``;
+    }
+
+    case 'strong': case 'b': {
+      const text = convertChildren(node, ctx).trim();
+      if (!text) return '';
+      return `**${text}**`;
+    }
+
+    case 'em': case 'i': {
+      const text = convertChildren(node, ctx).trim();
+      if (!text) return '';
+      return `*${text}*`;
+    }
+
+    case 's': case 'strike': case 'del': {
+      const text = convertChildren(node, ctx).trim();
+      if (!text) return '';
+      return `~~${text}~~`;
+    }
+
+    case 'a': {
+      const href = node.attrs.href || '';
+      const text = convertChildren(node, ctx).trim();
+      if (!text) return '';
+      // Skip javascript: and empty links
+      if (!href || href.startsWith('javascript:') || href === '#') return text;
+      // Skip if text is same as href (common in newsletters)
+      if (text === href) return `<${href}>`;
+      return `[${text}](${href})`;
+    }
+
+    case 'img': {
+      const src = node.attrs.src || '';
+      const alt = node.attrs.alt || '';
+      if (!src) return '';
+      return `![${alt}](${src})`;
+    }
+
+    case 'ul': {
+      const items = convertListItems(node, ctx, '-');
+      return `\n\n${items}\n\n`;
+    }
+
+    case 'ol': {
+      const items = convertListItems(node, ctx, '1.');
+      return `\n\n${items}\n\n`;
+    }
+
+    case 'li': {
+      const text = convertChildren(node, ctx).trim();
+      const marker = ctx.listMarker || '-';
+      return `${marker} ${text}`;
+    }
+
+    case 'table':
+      return convertTable(node, ctx);
+
+    case 'thead': case 'tbody': case 'tfoot':
+      return convertChildren(node, ctx);
+
+    case 'tr': case 'th': case 'td':
+      // Handled by convertTable
+      return convertChildren(node, ctx);
+
+    case 'sup': {
+      const text = convertChildren(node, ctx).trim();
+      return text ? `^${text}` : '';
+    }
+
+    case 'sub': {
+      const text = convertChildren(node, ctx).trim();
+      return text ? `~${text}` : '';
+    }
+
+    case 'details': case 'summary':
+    case 'dl': case 'dt': case 'dd': {
+      const text = convertChildren(node, ctx).trim();
+      if (!text) return '';
+      return `\n\n${text}\n\n`;
+    }
+
+    // Inline or unknown tags: just pass through children
+    default:
+      return convertChildren(node, ctx);
+  }
+}
+
+function convertChildren(node, ctx) {
+  return node.children.map((child) => convertNode(child, ctx)).join('');
+}
+
+function convertListItems(node, ctx, marker) {
+  const items = [];
+  for (const child of node.children) {
+    if (child.tag === 'li') {
+      const text = convertChildren(child, ctx).trim();
+      if (text) {
+        // Indent continuation lines
+        const lines = text.split('\n');
+        const first = `${marker} ${lines[0]}`;
+        const rest = lines.slice(1).map((l) => `  ${l}`);
+        items.push([first, ...rest].join('\n'));
+      }
+    } else if (child.tag === '#text' && !child.text.trim()) {
+      continue; // skip whitespace
+    } else {
+      // Non-li children inside a list (malformed HTML)
+      const text = convertNode(child, ctx).trim();
+      if (text) items.push(`${marker} ${text}`);
+    }
+  }
+  return items.join('\n');
+}
+
+function convertTable(tableNode, ctx) {
+  const rows = [];
+
+  function collectRows(node) {
+    for (const child of node.children) {
+      if (child.tag === 'tr') {
+        rows.push(child);
+      } else if (child.tag === 'thead' || child.tag === 'tbody' || child.tag === 'tfoot') {
+        collectRows(child);
+      }
+    }
+  }
+  collectRows(tableNode);
+
+  if (rows.length === 0) return '';
+
+  // Check if this is a layout table (common in newsletters) vs a data table
+  // Layout tables typically have 1-2 cells or nested tables
+  const firstRowCells = rows[0].children.filter(
+    (c) => c.tag === 'td' || c.tag === 'th'
+  );
+  const hasNestedTable = rows.some((row) =>
+    row.children.some((cell) => {
+      function hasTable(n) {
+        if (n.tag === 'table') return true;
+        return (n.children || []).some(hasTable);
+      }
+      return hasTable(cell);
+    })
+  );
+
+  // If it looks like a layout table, just convert content as blocks
+  if (hasNestedTable || (rows.length <= 2 && firstRowCells.length <= 1)) {
+    return convertChildren(tableNode, ctx);
+  }
+
+  // Convert as a proper markdown table
+  const mdRows = [];
+  for (const row of rows) {
+    const cells = row.children
+      .filter((c) => c.tag === 'td' || c.tag === 'th')
+      .map((c) => convertChildren(c, ctx).trim().replace(/\|/g, '\\|').replace(/\n/g, ' '));
+    mdRows.push(cells);
+  }
+
+  if (mdRows.length === 0) return '';
+
+  // Determine column count
+  const colCount = Math.max(...mdRows.map((r) => r.length));
+
+  // Pad rows to same column count
+  for (const row of mdRows) {
+    while (row.length < colCount) row.push('');
+  }
+
+  // Build table
+  const lines = [];
+  lines.push('| ' + mdRows[0].join(' | ') + ' |');
+  lines.push('| ' + mdRows[0].map(() => '---').join(' | ') + ' |');
+  for (let i = 1; i < mdRows.length; i++) {
+    lines.push('| ' + mdRows[i].join(' | ') + ' |');
+  }
+
+  return '\n\n' + lines.join('\n') + '\n\n';
+}
+
+function cleanMarkdown(md) {
+  return md
+    // Collapse multiple blank lines to two newlines (one blank line)
+    .replace(/\n{3,}/g, '\n\n')
+    // Remove leading/trailing whitespace on lines (but not in code blocks)
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .join('\n')
+    // Remove spaces before/after newlines around block markers
+    .replace(/\n +\n/g, '\n\n')
+    // Trim the whole output
+    .trim() + '\n';
+}
+
+// --- Main ---
+
+function html2md(html) {
+  const tree = parseHTML(html);
+  const raw = convertNode(tree);
+  return cleanMarkdown(raw);
+}
+
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => { input += chunk; });
+process.stdin.on('end', () => {
+  process.stdout.write(html2md(input));
+});

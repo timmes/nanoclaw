@@ -78,16 +78,9 @@ function buildVolumeMounts(
       readonly: true,
     });
 
-    // Shadow .env so the agent cannot read secrets from the mounted project root.
-    // Credentials are injected by the credential proxy, never exposed to containers.
-    const envFile = path.join(projectRoot, '.env');
-    if (fs.existsSync(envFile)) {
-      mounts.push({
-        hostPath: '/dev/null',
-        containerPath: '/workspace/project/.env',
-        readonly: true,
-      });
-    }
+    // .env shadowing: Apple Container only supports directory mounts, so the
+    // Dockerfile entrypoint uses `mount --bind /dev/null` inside the container.
+    // No host-side mount needed — the entrypoint handles it when running as root.
 
     // Main also gets its group folder as the working directory
     mounts.push({
@@ -201,6 +194,16 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Secrets directory (read-only) — service account keys, API tokens, etc.
+  const secretsDir = path.join(DATA_DIR, 'secrets');
+  if (fs.existsSync(secretsDir)) {
+    mounts.push({
+      hostPath: secretsDir,
+      containerPath: '/workspace/secrets',
+      readonly: true,
+    });
+  }
+
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
@@ -223,6 +226,11 @@ function buildContainerArgs(
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Google Calendar config (service account key is mounted at /workspace/secrets/)
+  if (process.env.GCAL_CALENDAR_ID) {
+    args.push('-e', `GCAL_CALENDAR_ID=${process.env.GCAL_CALENDAR_ID}`);
+  }
 
   // Route API traffic through the credential proxy (containers never see real secrets)
   args.push(

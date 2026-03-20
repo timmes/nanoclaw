@@ -274,6 +274,7 @@ async function runAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
+  logger.debug({ group: group.name, isMain, rawIsMain: group.isMain }, 'runAgent isMain check');
   const sessionId = sessions[group.folder];
 
   // Update tasks snapshot for container to read (filtered by group)

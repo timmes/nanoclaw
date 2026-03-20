@@ -47,8 +47,12 @@ COPY agent-runner/ ./
 # Build TypeScript
 RUN npm run build
 
+# Install CLI tools
+COPY tools/ /usr/local/bin/
+RUN chmod +x /usr/local/bin/gcal /usr/local/bin/gmail /usr/local/bin/html2md
+
 # Create workspace directories
-RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
+RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/secrets /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
 
 # Create entrypoint script
 # Container input (prompt, group info) is passed via stdin JSON.
