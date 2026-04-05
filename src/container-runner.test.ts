@@ -16,6 +16,8 @@ vi.mock('./config.js', () => ({
   GROUPS_DIR: '/tmp/nanoclaw-test-groups',
   IDLE_TIMEOUT: 1800000, // 30min
   TIMEZONE: 'America/Los_Angeles',
+  ONECLI_URL: undefined,
+  OLLAMA_ADMIN_TOOLS: false,
 }));
 
 // Mock logger
@@ -63,6 +65,13 @@ vi.mock('./container-runtime.js', () => ({
 // Mock credential-proxy
 vi.mock('./credential-proxy.js', () => ({
   detectAuthMode: vi.fn(() => 'api-key'),
+}));
+
+// Mock OneCLI SDK
+vi.mock('@onecli-sh/sdk', () => ({
+  OneCLI: class {
+    applyContainerConfig = vi.fn(async () => false);
+  },
 }));
 
 // Create a controllable fake ChildProcess
@@ -144,6 +153,9 @@ describe('container-runner timeout behavior', () => {
       onOutput,
     );
 
+    // Flush async buildContainerArgs before emitting events
+    await vi.advanceTimersByTimeAsync(0);
+
     // Emit output with a result
     emitOutputMarker(fakeProc, {
       status: 'success',
@@ -180,6 +192,9 @@ describe('container-runner timeout behavior', () => {
       onOutput,
     );
 
+    // Flush async buildContainerArgs
+    await vi.advanceTimersByTimeAsync(0);
+
     // No output emitted — fire the hard timeout
     await vi.advanceTimersByTimeAsync(1830000);
 
@@ -202,6 +217,9 @@ describe('container-runner timeout behavior', () => {
       () => {},
       onOutput,
     );
+
+    // Flush async buildContainerArgs
+    await vi.advanceTimersByTimeAsync(0);
 
     // Emit output
     emitOutputMarker(fakeProc, {
