@@ -3,6 +3,7 @@
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
 import { execSync } from 'child_process';
+import fs from 'fs';
 import os from 'os';
 
 import { logger } from './logger.js';
@@ -24,7 +25,7 @@ function detectHostGateway(): string {
   if (CONTAINER_RUNTIME_BIN === 'container') {
     // Apple Container: detect gateway IP from bridge interface
     const ifaces = os.networkInterfaces();
-    const bridge = ifaces['bridge100'];
+    const bridge = ifaces['bridge100'] || ifaces['bridge0'];
     if (bridge) {
       const ipv4 = bridge.find((a) => a.family === 'IPv4');
       if (ipv4) return ipv4.address;
@@ -88,7 +89,7 @@ export function stopContainer(name: string): void {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
     throw new Error(`Invalid container name: ${name}`);
   }
-  execSync(`${CONTAINER_RUNTIME_BIN} stop -t 1 ${name}`, { stdio: 'pipe' });
+  execSync(`${CONTAINER_RUNTIME_BIN} stop ${name}`, { stdio: 'pipe' });
 }
 
 /** Ensure the container runtime is running, starting it if needed. */
