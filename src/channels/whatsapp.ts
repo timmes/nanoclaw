@@ -32,6 +32,14 @@ import { registerChannel, ChannelOpts } from './registry.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
+// Baileys expects a pino-compatible logger with child(), level, and trace()
+const baileysLogger = {
+  ...logger,
+  level: 'warn',
+  trace: (dataOrMsg: any, msg?: string) => logger.debug(typeof dataOrMsg === 'string' ? dataOrMsg : dataOrMsg, msg),
+  child: () => baileysLogger,
+} as any;
+
 export interface WhatsAppChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
@@ -77,10 +85,10 @@ export class WhatsAppChannel implements Channel {
       version,
       auth: {
         creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger as any),
+        keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
       },
       printQRInTerminal: false,
-      logger: logger as any,
+      logger: baileysLogger,
       browser: Browsers.macOS('Chrome'),
     });
 
