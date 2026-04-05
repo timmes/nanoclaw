@@ -14,6 +14,8 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
+  OLLAMA_ADMIN_TOOLS,
+  ONECLI_URL,
   TIMEZONE,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
@@ -26,8 +28,11 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { OneCLI } from '@onecli-sh/sdk';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+
+const onecli = new OneCLI({ url: ONECLI_URL });
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -248,6 +253,11 @@ function buildContainerArgs(
   // Google Calendar config (service account key is mounted at /workspace/secrets/)
   if (process.env.GCAL_CALENDAR_ID) {
     args.push('-e', `GCAL_CALENDAR_ID=${process.env.GCAL_CALENDAR_ID}`);
+  }
+
+  // Forward Ollama admin tools flag if enabled
+  if (OLLAMA_ADMIN_TOOLS) {
+    args.push('-e', 'OLLAMA_ADMIN_TOOLS=true');
   }
 
   // OneCLI gateway handles credential injection — containers never see real secrets.
